@@ -96,12 +96,27 @@ EXPORT_DEFAULT = os.path.join(APP_DIR, "working_vless.txt")
 # Подписки по умолчанию — несколько широко известных публичных коллекторов.
 # Пользователь может добавлять/удалять их в настройках.
 DEFAULT_SOURCES: list[str] = [
-    "https://raw.githubusercontent.com/yebekhe/TVC/main/subscriptions/xray/normal/vless",
-    "https://raw.githubusercontent.com/MhdiTaheri/V2rayCollector/main/sub/Mix/mix.txt",
+    "https://raw.githubusercontent.com/itsyebekhe/PSG/main/subscriptions/xray/normal/vless",
+    "https://raw.githubusercontent.com/MhdiTaheri/V2rayCollector/main/sub/vless",
+    "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/Splitted-By-Protocol/vless.txt",
     "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt",
-    "https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/v2rayfree.txt",
-    "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Vless.txt",
+    "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/vless.txt",
 ]
+
+# Карта миграций: старые URL, которые больше не отвечают (404 / переименование
+# репозитория / переезд файла) → новый адрес или None, если замены нет.
+# Применяется при загрузке sources.json, чтобы у пользователей со старым
+# конфигом сломанные ссылки автоматически заменялись на рабочие.
+SOURCE_MIGRATIONS: dict[str, str | None] = {
+    "https://raw.githubusercontent.com/yebekhe/TVC/main/subscriptions/xray/normal/vless":
+        "https://raw.githubusercontent.com/itsyebekhe/PSG/main/subscriptions/xray/normal/vless",
+    "https://raw.githubusercontent.com/MhdiTaheri/V2rayCollector/main/sub/Mix/mix.txt":
+        "https://raw.githubusercontent.com/MhdiTaheri/V2rayCollector/main/sub/vless",
+    "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Vless.txt":
+        "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/vless.txt",
+    # Файл удалён из репозитория, в нём остались только per-source списки.
+    "https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/v2rayfree.txt": None,
+}
 
 DEFAULT_TG_CHANNELS: list[str] = [
     "v2rayng_proxy",
@@ -199,13 +214,46 @@ def save_settings(settings: dict) -> None:
     save_json(SETTINGS_PATH, settings)
 
 
+def _migrate_sources(sources: list[str]) -> tuple[list[str], bool]:
+    """Заменяет известные сломанные URL на актуальные согласно SOURCE_MIGRATIONS.
+    Возвращает (новый_список, было_ли_изменение)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    changed = False
+    for src in sources:
+        if src in SOURCE_MIGRATIONS:
+            replacement = SOURCE_MIGRATIONS[src]
+            changed = True
+            if replacement is None:
+                log(f"Источник {src} больше не существует — удалён из настроек")
+                continue
+            log(f"Источник {src} переехал → {replacement}")
+            if replacement in seen:
+                continue
+            out.append(replacement)
+            seen.add(replacement)
+        else:
+            if src in seen:
+                continue
+            out.append(src)
+            seen.add(src)
+    return out, changed
+
+
 def load_sources() -> list[str]:
     data = load_json(SOURCES_PATH, None)
     if data is None:
         save_json(SOURCES_PATH, DEFAULT_SOURCES)
         return list(DEFAULT_SOURCES)
     if isinstance(data, list):
-        return [str(x).strip() for x in data if str(x).strip()]
+        sources = [str(x).strip() for x in data if str(x).strip()]
+        sources, migrated = _migrate_sources(sources)
+        if not sources:
+            sources = list(DEFAULT_SOURCES)
+            migrated = True
+        if migrated:
+            save_json(SOURCES_PATH, sources)
+        return sources
     return list(DEFAULT_SOURCES)
 
 
@@ -266,9 +314,18 @@ class Proxy:
 
 def _try_b64decode(text: str) -> str | None:
     """Возвращает декодированный текст, если `text` похож на base64 и
-    содержит после декодирования хотя бы одну vless-ссылку."""
+    содержит после декодирования хотя бы одну vless-ссылку.
+
+    Корректный base64 — всегда ASCII, поэтому если в тексте есть не-ASCII
+    символы (emoji, кириллица в заголовках подписки и т. п.) — это уже не
+    base64-подписка, и пытаться декодировать не нужно. Без этой проверки
+    `base64.b64decode` бросает `ValueError` на не-ASCII входе и роняет
+    всю процедуру скрапинга.
+    """
     stripped = text.strip()
     if len(stripped) < 24:
+        return None
+    if not stripped.isascii():
         return None
     # допускаем url-safe и обычный base64 без подложек
     cleaned = re.sub(r"\s+", "", stripped)
@@ -276,7 +333,7 @@ def _try_b64decode(text: str) -> str | None:
     for variant in (padded, padded.replace("-", "+").replace("_", "/")):
         try:
             decoded = base64.b64decode(variant, validate=False).decode("utf-8", errors="replace")
-        except (binascii.Error, UnicodeDecodeError):
+        except (binascii.Error, UnicodeDecodeError, ValueError):
             continue
         if "vless://" in decoded.lower():
             return decoded
@@ -398,7 +455,10 @@ def extract_vless_from_text(text: str, source: str = "") -> list[Proxy]:
 # =============================================================================
 
 def scrape_url(url: str, timeout: float = 15.0) -> list[Proxy]:
-    """Скачивает подписку и достаёт из неё все vless-ссылки."""
+    """Скачивает подписку и достаёт из неё все vless-ссылки.
+    Любые ошибки сети/парсинга для одного источника не должны ронять
+    общую процедуру обновления — поэтому всё, что упало, логируется и
+    возвращается пустой список."""
     headers = {"User-Agent": f"{APP_NAME}/{APP_VERSION}"}
     try:
         resp = requests.get(url, timeout=timeout, headers=headers)
@@ -406,7 +466,11 @@ def scrape_url(url: str, timeout: float = 15.0) -> list[Proxy]:
     except Exception as exc:
         log(f"Источник {url} недоступен: {exc}")
         return []
-    return extract_vless_from_text(resp.text, source=url)
+    try:
+        return extract_vless_from_text(resp.text, source=url)
+    except Exception as exc:
+        log(f"Источник {url} не распарсился: {exc}")
+        return []
 
 
 def scrape_telegram(
