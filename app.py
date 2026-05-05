@@ -93,14 +93,26 @@ SOURCES_PATH = os.path.join(APP_DIR, "sources.json")
 TEMP_DIR = os.path.join(APP_DIR, "temp_xray_configs")
 EXPORT_DEFAULT = os.path.join(APP_DIR, "working_vless.txt")
 
-# Подписки по умолчанию — несколько широко известных публичных коллекторов.
+# Подписки по умолчанию — широкий набор активных публичных коллекторов.
+# Каждая ссылка проверена на актуальность и количество vless-конфигов.
 # Пользователь может добавлять/удалять их в настройках.
 DEFAULT_SOURCES: list[str] = [
-    "https://raw.githubusercontent.com/itsyebekhe/PSG/main/subscriptions/xray/normal/vless",
-    "https://raw.githubusercontent.com/MhdiTaheri/V2rayCollector/main/sub/vless",
-    "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/Splitted-By-Protocol/vless.txt",
-    "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt",
+    # Большие сводные подписки (тысячи конфигов).
+    "https://raw.githubusercontent.com/mheidari98/.proxy/main/vless",
     "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/vless.txt",
+    "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/Splitted-By-Protocol/vless.txt",
+    "https://raw.githubusercontent.com/barry-far/V2ray-Config/main/Splitted-By-Protocol/vless.txt",
+    "https://raw.githubusercontent.com/Surfboardv2ray/TGParse/main/python/vless",
+    # Средние коллекторы.
+    "https://raw.githubusercontent.com/HosseinKoofi/GO_V2rayCollector/main/mixed_iran.txt",
+    "https://raw.githubusercontent.com/MhdiTaheri/V2rayCollector/main/sub/vless",
+    "https://raw.githubusercontent.com/itsyebekhe/PSG/main/subscriptions/xray/normal/vless",
+    "https://raw.githubusercontent.com/MhdiTaheri/V2rayCollector_Py/main/sub/Mix/mix.txt",
+    "https://raw.githubusercontent.com/ndsphonemy/proxy-sub/main/speed.txt",
+    # Меньшие, но часто живые подборки — добавляют разнообразия источников.
+    "https://raw.githubusercontent.com/Roosterkid/openproxylist/main/V2RAY_RAW.txt",
+    "https://raw.githubusercontent.com/Kwinshadow/TelegramV2rayCollector/main/sublinks/vless.txt",
+    "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt",
 ]
 
 # Карта миграций: старые URL, которые больше не отвечают (404 / переименование
@@ -116,6 +128,11 @@ SOURCE_MIGRATIONS: dict[str, str | None] = {
         "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/vless.txt",
     # Файл удалён из репозитория, в нём остались только per-source списки.
     "https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/v2rayfree.txt": None,
+    # All_Configs_Sub.txt — те же конфиги, что и в Splitted-By-Protocol/vless.txt
+    # плюс мусор других протоколов; заменяем на vless-конкретный путь, чтобы
+    # экономить трафик и время AAAA-резолвинга.
+    "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt":
+        "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/Splitted-By-Protocol/vless.txt",
 }
 
 DEFAULT_TG_CHANNELS: list[str] = [
@@ -1399,31 +1416,41 @@ class App(ctk.CTk):
 
     # ------------------------------------------------------------ Скрапинг (фон)
     def _scrape_worker(self) -> None:
-        """Фоновый поток: тянем все источники и Telegram, добавляем
-        новые прокси в self.proxies через UI-очередь."""
+        """Фоновый поток: тянем все источники и Telegram параллельно,
+        размечаем IPv6 (AAAA-резолвинг) и добавляем новые прокси в
+        self.proxies через UI-очередь."""
         try:
             sources = list(self.sources)
             tg_cfg = self.settings.get("telegram", {})
             tg_enabled = bool(tg_cfg.get("enabled")) and HAS_TELETHON
             total_steps = len(sources) + (1 if tg_enabled else 0)
             done = 0
+            done_lock = threading.Lock()
 
             def step(label: str) -> None:
                 nonlocal done
-                done += 1
-                progress = done / max(1, total_steps)
-                self._post(lambda: self.progress.set(progress))
-                self._post(lambda: self.log_status(label))
+                with done_lock:
+                    done += 1
+                    progress = done / max(1, total_steps)
+                self._post(lambda p=progress: self.progress.set(p))
+                self._post(lambda lbl=label: self.log_status(lbl))
 
             new_proxies: list[Proxy] = []
+            new_lock = threading.Lock()
 
-            for url in sources:
+            def fetch_one(url: str) -> None:
                 if self.cancel_event.is_set():
-                    break
-                self._post(lambda u=url: self.log_status(f"Скачиваю: {u}"))
+                    return
                 fetched = scrape_url(url)
-                new_proxies.extend(fetched)
+                with new_lock:
+                    new_proxies.extend(fetched)
                 step(f"Источник {url}: {len(fetched)} ссылок")
+
+            self._post(lambda n=len(sources): self.log_status(
+                f"Скачиваю {n} источников параллельно…"
+            ))
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as ex:
+                list(ex.map(fetch_one, sources))
 
             if tg_enabled and not self.cancel_event.is_set():
                 self._post(lambda: self.log_status("Telegram: подключаюсь…"))
@@ -1434,31 +1461,55 @@ class App(ctk.CTk):
                     search_keywords=tg_cfg.get("search_keywords", []),
                     messages_limit=int(tg_cfg.get("messages_limit", 200)),
                 )
-                new_proxies.extend(fetched)
+                with new_lock:
+                    new_proxies.extend(fetched)
                 step(f"Telegram: {len(fetched)} ссылок")
 
-            # IPv6-фильтр: если включён — резолвим домены и оставляем только IPv6.
+            # Размечаем IPv6 для всех прокси, у которых статус неизвестен.
+            # Делаем это всегда (а не только при ipv6_only), чтобы:
+            #   * сортировка таблицы могла поднять IPv6-узлы наверх;
+            #   * при включении «Только IPv6» в UI ответ был мгновенным.
+            # Резолвинг параллельный, чтобы тысячи AAAA-запросов не висели час.
+            if new_proxies and not self.cancel_event.is_set():
+                pending = [p for p in new_proxies if p.is_ipv6 is None]
+                if pending:
+                    self._post(lambda n=len(pending): self.log_status(
+                        f"AAAA-резолвинг для приоритезации IPv6 ({n} хостов)…"
+                    ))
+                    seen: dict[str, bool] = {}
+
+                    def resolve_one(p: Proxy) -> None:
+                        if self.cancel_event.is_set():
+                            return
+                        addr = p.address
+                        cached = seen.get(addr)
+                        if cached is not None:
+                            p.is_ipv6 = cached
+                            return
+                        try:
+                            v6 = is_ipv6_host(addr)
+                        except Exception:
+                            v6 = False
+                        seen[addr] = v6
+                        p.is_ipv6 = v6
+
+                    with ThreadPoolExecutor(max_workers=32) as ex:
+                        list(ex.map(resolve_one, pending))
+
+            # Жёсткий IPv6-фильтр (если пользователь включил «Только IPv6»).
             if self.settings.get("ipv6_only") and new_proxies and not self.cancel_event.is_set():
-                self._post(lambda: self.log_status("Фильтрую IPv6 (AAAA-резолвинг)…"))
-                filtered: list[Proxy] = []
-                for p in new_proxies:
-                    if self.cancel_event.is_set():
-                        break
-                    if p.is_ipv6 is True:
-                        filtered.append(p)
-                        continue
-                    if p.is_ipv6 is None:
-                        p.is_ipv6 = is_ipv6_host(p.address)
-                    if p.is_ipv6:
-                        filtered.append(p)
-                new_proxies = filtered
+                new_proxies = [p for p in new_proxies if p.is_ipv6]
 
             # Применяем
             def commit() -> None:
                 added = self._merge_proxies(new_proxies)
+                # Полная перерисовка, чтобы IPv6-приоритет сразу применился.
+                self._refresh_table()
                 self.progress.set(1.0)
+                v6 = sum(1 for p in self.proxies.values() if p.is_ipv6)
                 self.log_status(
-                    f"Готово. Добавлено {added} новых, всего: {len(self.proxies)}."
+                    f"Готово. Добавлено {added} новых, всего: {len(self.proxies)} "
+                    f"(IPv6: {v6})."
                 )
                 self.after(1500, lambda: self.progress.set(0))
 
@@ -1554,7 +1605,19 @@ class App(ctk.CTk):
         # Полная перерисовка — простой и надёжный способ.
         self.tree.delete(*self.tree.get_children())
         self.iid_to_url.clear()
-        for p in self.proxies.values():
+        # Сортировка: IPv6 наверху (приоритет), затем «рабочие → проверяющиеся
+        # → ожидающие → нерабочие», затем по возрастанию пинга. Сортируем
+        # стабильно (sorted) — порядок внутри одной группы остаётся как был.
+        status_order = {STATUS_OK: 0, STATUS_CHECKING: 1, STATUS_PENDING: 2, STATUS_FAIL: 3}
+        items = sorted(
+            self.proxies.values(),
+            key=lambda p: (
+                0 if p.is_ipv6 else 1,
+                status_order.get(p.status, 9),
+                p.ping_ms if p.ping_ms >= 0 else 10**9,
+            ),
+        )
+        for p in items:
             self._insert_row(p)
         self._update_counter()
 
@@ -1625,6 +1688,9 @@ class App(ctk.CTk):
             def finalize() -> None:
                 self.is_checking = False
                 self.executor = None
+                # Перерисовка с новой сортировкой: рабочие IPv6 → рабочие IPv4
+                # → проверяющиеся → нерабочие, по возрастанию пинга.
+                self._refresh_table()
                 if self.cancel_event.is_set():
                     self.log_status("Проверка остановлена.")
                 else:
