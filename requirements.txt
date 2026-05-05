@@ -1,0 +1,6 @@
+customtkinter>=5.2.2
+requests>=2.32.0
+dnspython>=2.6.1
+# Опционально: для сбора ссылок из Telegram-каналов.
+# Закомментируйте, если не нужен Telegram-скрапинг.
+telethon>=1.36.0
