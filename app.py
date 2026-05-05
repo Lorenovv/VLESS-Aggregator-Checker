@@ -84,7 +84,10 @@ except Exception:  # pragma: no cover
 # =============================================================================
 
 APP_NAME = "VLESS Aggregator & Checker"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
+# User-Agent для HTTP-запросов: отдельная ASCII-only строка (некоторые сервисы
+# и библиотеки чувствительны к не-ASCII в заголовках).
+USER_AGENT = f"VLESS-Aggregator-Checker/{APP_VERSION}"
 
 # Папка приложения (рядом с app.py); если запускается из site-packages — берём CWD.
 APP_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
@@ -151,8 +154,51 @@ STATUS_DOTS: dict[str, str] = {
 
 def log(msg: str) -> None:
     """Простой лог в stdout; не используем стандартный logging, чтобы не
-    усложнять. UI-логирование отдельно через `App.log_status`."""
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    усложнять. UI-логирование отдельно через `App.log_status`.
+
+    Важно: оборачиваем в try/except — в PyInstaller-`--windowed` сборке на
+    Windows у процесса нет консоли, и `print(...)` с не-ASCII текстом
+    легко падает с `string argument should contain only ASCII characters`
+    (зависит от того, во что PyInstaller перенаправил stdout). Лог не
+    должен ронять основное приложение."""
+    try:
+        print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    except Exception:
+        # Никаких уведомлений — иначе рекурсия. Лог просто теряется.
+        pass
+
+
+class _NullStream:
+    """Безопасная заглушка для sys.stdout/sys.stderr, если PyInstaller
+    `--windowed` оставил их None или какой-то ASCII-only Win32-handle."""
+
+    def write(self, _data: str) -> int:  # pragma: no cover
+        return 0
+
+    def flush(self) -> None:  # pragma: no cover
+        pass
+
+    def isatty(self) -> bool:  # pragma: no cover
+        return False
+
+
+def _harden_std_streams() -> None:
+    """Делает sys.stdout/sys.stderr пригодными для записи произвольного
+    Unicode-текста. Вызывается из `main()` — особенно важно для собранного
+    `.exe` на Windows, где stdout/stderr могут быть `None`."""
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None:
+            setattr(sys, name, _NullStream())
+            continue
+        # На Python 3.7+ есть `reconfigure` — переключим в UTF-8 с
+        # `errors='replace'`, чтобы любой Unicode корректно сериализовался.
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
 
 
 def load_json(path: str, default: Any) -> Any:
@@ -398,15 +444,24 @@ def extract_vless_from_text(text: str, source: str = "") -> list[Proxy]:
 # =============================================================================
 
 def scrape_url(url: str, timeout: float = 15.0) -> list[Proxy]:
-    """Скачивает подписку и достаёт из неё все vless-ссылки."""
-    headers = {"User-Agent": f"{APP_NAME}/{APP_VERSION}"}
+    """Скачивает подписку и достаёт из неё все vless-ссылки.
+
+    Никогда не выбрасывает исключение наружу — на любую ошибку (DNS, SSL,
+    HTTP, парсер) возвращает пустой список. Это критично, потому что
+    скрапинг идёт по списку источников, и одна битая подписка не должна
+    обрушивать остальные."""
+    headers = {"User-Agent": USER_AGENT}
     try:
         resp = requests.get(url, timeout=timeout, headers=headers)
         resp.raise_for_status()
     except Exception as exc:
-        log(f"Источник {url} недоступен: {exc}")
+        log(f"Источник {url} недоступен: {exc!r}")
         return []
-    return extract_vless_from_text(resp.text, source=url)
+    try:
+        return extract_vless_from_text(resp.text, source=url)
+    except Exception as exc:
+        log(f"Ошибка парсинга {url}: {exc!r}")
+        return []
 
 
 def scrape_telegram(
@@ -709,7 +764,7 @@ def check_proxy(
                 proxies=proxies_dict,
                 timeout=timeout,
                 allow_redirects=False,
-                headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"},
+                headers={"User-Agent": USER_AGENT},
             )
         except requests.exceptions.RequestException as exc:
             return CheckResult(False, -1, f"req: {exc.__class__.__name__}")
@@ -1357,19 +1412,30 @@ class App(ctk.CTk):
                 if self.cancel_event.is_set():
                     break
                 self._post(lambda u=url: self.log_status(f"Скачиваю: {u}"))
-                fetched = scrape_url(url)
+                # Ещё один защитный try/except: scrape_url теоретически
+                # уже не выбрасывает, но мало ли — крах одного источника
+                # никогда не должен обрывать обработку остальных.
+                try:
+                    fetched = scrape_url(url)
+                except Exception as exc:
+                    log(f"Скрапер упал на {url}: {exc!r}")
+                    fetched = []
                 new_proxies.extend(fetched)
                 step(f"Источник {url}: {len(fetched)} ссылок")
 
             if tg_enabled and not self.cancel_event.is_set():
                 self._post(lambda: self.log_status("Telegram: подключаюсь…"))
-                fetched = scrape_telegram(
-                    api_id=str(tg_cfg.get("api_id", "")),
-                    api_hash=str(tg_cfg.get("api_hash", "")),
-                    channels=tg_cfg.get("channels", []),
-                    search_keywords=tg_cfg.get("search_keywords", []),
-                    messages_limit=int(tg_cfg.get("messages_limit", 200)),
-                )
+                try:
+                    fetched = scrape_telegram(
+                        api_id=str(tg_cfg.get("api_id", "")),
+                        api_hash=str(tg_cfg.get("api_hash", "")),
+                        channels=tg_cfg.get("channels", []),
+                        search_keywords=tg_cfg.get("search_keywords", []),
+                        messages_limit=int(tg_cfg.get("messages_limit", 200)),
+                    )
+                except Exception as exc:
+                    log(f"Telegram-скрапер упал: {exc!r}")
+                    fetched = []
                 new_proxies.extend(fetched)
                 step(f"Telegram: {len(fetched)} ссылок")
 
@@ -1400,8 +1466,9 @@ class App(ctk.CTk):
 
             self._post(commit)
         except Exception as exc:
-            self._post(lambda e=exc: self.log_status(f"Скрапинг упал: {e}"))
-            traceback.print_exc()
+            self._post(lambda e=exc: self.log_status(f"Скрапинг упал: {e!r}"))
+            with contextlib.suppress(Exception):
+                traceback.print_exc()
         finally:
             self.is_scraping = False
 
@@ -1598,6 +1665,9 @@ class App(ctk.CTk):
 # =============================================================================
 
 def main() -> None:
+    # ОБЯЗАТЕЛЬНО первым — иначе print() с не-ASCII текстом из любой
+    # другой инициализации может уронить процесс в --windowed exe.
+    _harden_std_streams()
     os.makedirs(TEMP_DIR, exist_ok=True)
     # Гарантируем дефолтные файлы конфига при первом запуске.
     if not os.path.exists(SETTINGS_PATH):
