@@ -71,6 +71,17 @@ try:
 except Exception:  # pragma: no cover
     HAS_DNS = False
 
+# PySocks нужен для requests, чтобы тот умел ходить через socks5h://.
+# Без него каждый проксичек падает с `InvalidSchema: Missing dependencies
+# for SOCKS support` — и пользователь видит «0 рабочих» из любого
+# количества прокси, не понимая почему. Импорт здесь нужен ещё и для
+# того, чтобы PyInstaller подхватил пакет в автоматическую сборку exe.
+try:
+    import socks  # type: ignore  # noqa: F401  (нужен для requests[socks])
+    HAS_SOCKS = True
+except Exception:  # pragma: no cover
+    HAS_SOCKS = False
+
 # Telethon — опционально, только если пользователь включит Telegram-скрапинг.
 try:
     from telethon.sync import TelegramClient  # type: ignore  # noqa: F401
@@ -838,6 +849,11 @@ def check_proxy(
             return CheckResult(False, -1, "http: connect timeout")
         except requests.exceptions.ReadTimeout:
             return CheckResult(False, -1, "http: read timeout")
+        except requests.exceptions.InvalidSchema:
+            # InvalidSchema на socks5h:// = в окружении нет PySocks.
+            # Это не «прокси сломан», а сборка/окружение. Сообщение должно
+            # быть кричащим, чтобы юзер сразу понял, что делать.
+            return CheckResult(False, -1, "build: PySocks отсутствует — переустановите")
         except requests.exceptions.ProxyError as exc:
             # ProxyError обычно значит, что xray поднялся, но прокси-нода
             # отвалилась после установки socks (TLS/handshake внутри xray).
