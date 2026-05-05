@@ -5,7 +5,7 @@
 через локальный [Xray-core](https://github.com/XTLS/Xray-core), фильтр «только IPv6»,
 импорт из подписок / Telegram / буфера обмена / файла, экспорт рабочих ссылок.
 
-![Python](https://img.shields.io/badge/python-3.10%2B-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey) [![Build](https://github.com/Lorenovv/VLESS-Aggregator-Checker/actions/workflows/build.yml/badge.svg)](https://github.com/Lorenovv/VLESS-Aggregator-Checker/actions/workflows/build.yml)
 
 ## Возможности
 
@@ -25,6 +25,25 @@
 - **Кроссплатформенно**: Windows, macOS, Linux. Всё в одном файле `app.py`.
 
 ## Установка
+
+### 🪟 Windows: готовый .exe (без установки Python)
+
+Самый простой вариант — скачать собранный `VLESS-Aggregator-Checker.exe`:
+
+1. Перейдите на страницу [Actions](https://github.com/Lorenovv/VLESS-Aggregator-Checker/actions/workflows/build.yml).
+2. Откройте последний успешный запуск (✅) → секция **Artifacts** →
+   **VLESS-Aggregator-Checker-windows-exe** → скачайте архив.
+3. Распакуйте и запустите `VLESS-Aggregator-Checker.exe`.
+
+Стабильные сборки также публикуются на странице
+[Releases](https://github.com/Lorenovv/VLESS-Aggregator-Checker/releases) при
+выпуске тега `vX.Y.Z`.
+
+> Windows SmartScreen может предупредить о неподписанном исполняемом файле — это
+> нормально для бинарников из CI без code-signing сертификата. Нажмите
+> «Подробнее» → «Выполнить в любом случае».
+
+### 🐍 Запуск из исходников (любая ОС)
 
 Требуется **Python 3.10+** и **Tk** (на Linux может потребоваться установить
 `python3-tk` через пакетный менеджер).
@@ -86,11 +105,30 @@ python app.py
 
 ```
 .
-├── app.py             # вся логика и UI (один файл)
-├── requirements.txt   # зависимости
+├── app.py                              # вся логика и UI (один файл)
+├── requirements.txt                    # зависимости
+├── .github/workflows/build.yml         # автосборка Windows .exe (PyInstaller)
 ├── README.md
+├── LICENSE
 └── .gitignore
 ```
+
+## Сборка .exe вручную (если нужно локально)
+
+```bash
+pip install pyinstaller
+pyinstaller --onefile --windowed \
+    --name "VLESS-Aggregator-Checker" \
+    --collect-all customtkinter \
+    --hidden-import dns.resolver \
+    --hidden-import telethon \
+    app.py
+# Готовый бинарник: dist/VLESS-Aggregator-Checker.exe
+```
+
+То же самое автоматически делает GitHub Actions при push в `main` или
+открытии PR — артефакт лежит на странице Actions, релиз создаётся при
+тегировании.
 
 ## Лицензия
 

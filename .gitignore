@@ -18,6 +18,11 @@ working_vless.txt
 temp_xray_configs/
 tg_session*
 
+# PyInstaller build outputs
+build/
+dist/
+*.spec
+
 # IDE
 .vscode/
 .idea/
