@@ -145,8 +145,14 @@ DEFAULT_TG_CHANNELS: list[str] = [
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "xray_path": "",                  # путь к бинарнику xray (если пусто — ищем в PATH)
-    "timeout_sec": 8,                  # таймаут одной проверки
-    "threads": 20,                     # количество потоков проверки
+    # Таймаут одной HTTP-проверки. 8 сек оказалось мало: VLESS+CDN+TLS
+    # handshake часто не успевает уложиться, особенно через медленный
+    # IPv6 path. 12 сек даёт большинству живых нод шанс ответить.
+    "timeout_sec": 12,
+    # Параллельность чека. 20 одновременно стартующих xray-инстансов на
+    # обычной машине — гонка за ресурсами и фолс-фейлы по таймауту;
+    # 8 — компромисс между скоростью и стабильностью.
+    "threads": 8,
     "test_url": "http://cp.cloudflare.com/",
     "auto_refresh_min": 0,             # 0 = выключено, иначе минут между авто-обновлениями
     "ipv6_only": False,
@@ -740,6 +746,33 @@ def _wait_socks_ready(port: int, timeout: float) -> bool:
     return False
 
 
+def _tcp_reachable(host: str, port: int, timeout: float) -> tuple[bool, str]:
+    """Быстрый TCP-предчек: пытается открыть TCP-соединение к (host, port).
+    Возвращает (reachable, error_category). Категории — короткие (`tcp: …`,
+    `dns: …`), их позже можно агрегировать в статус-бар после проверки.
+
+    Идея: подавляющее большинство публичных VLESS-нод мертвы. Запускать
+    xray на каждой — медленно (2-3 сек на старт + JSON + socks). А TCP
+    connect занимает максимум `timeout` сек и параллелится без проблем,
+    так что 80-95% дохлых нод можно отсеять быстро, оставив xray-чек
+    только живым.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True, ""
+    except socket.gaierror:
+        return False, "dns: не резолвится"
+    except (TimeoutError, socket.timeout):
+        return False, "tcp: таймаут"
+    except ConnectionRefusedError:
+        return False, "tcp: connection refused"
+    except OSError as e:
+        msg = str(e).lower()
+        if "unreachable" in msg or "no route" in msg:
+            return False, "tcp: unreachable"
+        return False, f"tcp: errno {e.errno}" if e.errno else "tcp: error"
+
+
 def check_proxy(
     proxy: Proxy,
     xray_path: str,
@@ -747,8 +780,12 @@ def check_proxy(
     test_url: str,
     cancel_event: threading.Event,
 ) -> CheckResult:
-    """Запускает Xray для proxy и делает HTTP-запрос через SOCKS5.
-    Возвращает CheckResult(ok, ping_ms, error)."""
+    """Поднимает Xray для конкретной прокси и делает HTTP-запрос через
+    локальный SOCKS5. Возвращает CheckResult(ok, ping_ms, error).
+    Ошибки разнесены по категориям (`tls:`, `http:`, `xray:`, …),
+    чтобы в статус-баре после проверки можно было показать пользователю,
+    что именно фейлит. TCP-достижимость проверяется заранее на стадии 1
+    в `_start_checks`, сюда долетают только живые на TCP-уровне ноды."""
     if cancel_event.is_set():
         return CheckResult(False, -1, "отменено")
 
@@ -775,8 +812,11 @@ def check_proxy(
             creationflags=creation_flags,
         )
 
-        if not _wait_socks_ready(local_port, min(timeout, 5)):
-            return CheckResult(False, -1, "xray не поднял socks")
+        # xray обычно поднимает socks за 100-500мс, но на медленных Windows
+        # с антивирусом может стартовать до 3-4 сек. Не зависим от
+        # пользовательского timeout — отдельный фиксированный бюджет.
+        if not _wait_socks_ready(local_port, 5.0):
+            return CheckResult(False, -1, "xray: не запустил socks")
 
         if cancel_event.is_set():
             return CheckResult(False, -1, "отменено")
@@ -792,17 +832,27 @@ def check_proxy(
                 allow_redirects=False,
                 headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"},
             )
+        except requests.exceptions.SSLError:
+            return CheckResult(False, -1, "tls: handshake fail")
+        except requests.exceptions.ConnectTimeout:
+            return CheckResult(False, -1, "http: connect timeout")
+        except requests.exceptions.ReadTimeout:
+            return CheckResult(False, -1, "http: read timeout")
+        except requests.exceptions.ProxyError as exc:
+            # ProxyError обычно значит, что xray поднялся, но прокси-нода
+            # отвалилась после установки socks (TLS/handshake внутри xray).
+            return CheckResult(False, -1, "tunnel: closed")
         except requests.exceptions.RequestException as exc:
-            return CheckResult(False, -1, f"req: {exc.__class__.__name__}")
+            return CheckResult(False, -1, f"http: {exc.__class__.__name__}")
         elapsed_ms = int((time.perf_counter() - start) * 1000)
-        # Принимаем 2xx и 204 (generate_204 / cloudflare).
+        # Принимаем 2xx и 3xx (generate_204 / cp.cloudflare.com и редиректы).
         if 200 <= r.status_code < 400:
             return CheckResult(True, elapsed_ms)
-        return CheckResult(False, elapsed_ms, f"HTTP {r.status_code}")
+        return CheckResult(False, elapsed_ms, f"http: {r.status_code}")
     except FileNotFoundError:
-        return CheckResult(False, -1, "xray binary not found")
+        return CheckResult(False, -1, "xray: бинарник не найден")
     except Exception as exc:
-        return CheckResult(False, -1, f"err: {exc.__class__.__name__}: {exc}")
+        return CheckResult(False, -1, f"err: {exc.__class__.__name__}")
     finally:
         if proc is not None:
             with contextlib.suppress(Exception):
@@ -1169,7 +1219,7 @@ class App(ctk.CTk):
         self.tree.heading("name", text="Имя")
         self.tree.heading("addr", text="Адрес:Порт")
         self.tree.heading("proto", text="Сеть / Sec / Flow")
-        self.tree.heading("ping", text="Пинг, мс")
+        self.tree.heading("ping", text="Пинг / Ошибка")
         self.tree.heading("source", text="Источник")
         self.tree.column("status", width=44, anchor="center", stretch=False)
         self.tree.column("name", width=240)
@@ -1542,11 +1592,22 @@ class App(ctk.CTk):
         self._update_counter()
         return added
 
+    @staticmethod
+    def _ping_or_error(p: Proxy) -> str:
+        """Что показать в колонке «Пинг / Ошибка»: миллисекунды для
+        рабочих, краткую категорию ошибки для нерабочих, прочерк —
+        для ещё не проверенных."""
+        if p.ping_ms >= 0:
+            return f"{p.ping_ms}"
+        if p.status == STATUS_FAIL and p.error:
+            return p.error
+        return "—"
+
     def _insert_row(self, p: Proxy) -> None:
         if not self._proxy_visible(p):
             return
         proto = "/".join(filter(None, [p.network, p.security, p.flow])) or p.network
-        ping_text = f"{p.ping_ms}" if p.ping_ms >= 0 else "—"
+        ping_text = self._ping_or_error(p)
         self.tree.insert(
             "",
             "end",
@@ -1572,7 +1633,7 @@ class App(ctk.CTk):
             self.iid_to_url.pop(p.iid, None)
             return
         proto = "/".join(filter(None, [p.network, p.security, p.flow])) or p.network
-        ping_text = f"{p.ping_ms}" if p.ping_ms >= 0 else "—"
+        ping_text = self._ping_or_error(p)
         self.tree.item(
             p.iid,
             values=(p.status_dot(), p.name, p.short_addr(), proto, ping_text, p.source),
@@ -1635,8 +1696,14 @@ class App(ctk.CTk):
 
     # ------------------------------------------------------------ Проверка
     def _start_checks(self, proxies: list[Proxy], xray_path: str) -> None:
-        timeout = float(self.settings.get("timeout_sec", 8))
-        threads = int(self.settings.get("threads", 20))
+        """Двухстадийная проверка:
+        1) быстрый параллельный TCP-предчек (64 потока) — отсекает дохлые
+           хосты за секунды;
+        2) полный xray-чек (`threads` потоков) только для тех, кто прошёл
+           TCP. Так на 11k прокси экономится десятки минут.
+        """
+        timeout = float(self.settings.get("timeout_sec", 12))
+        threads = int(self.settings.get("threads", 8))
         test_url = str(self.settings.get("test_url") or DEFAULT_SETTINGS["test_url"])
         total = len(proxies)
         done = {"n": 0}
@@ -1648,59 +1715,123 @@ class App(ctk.CTk):
             self._post(lambda pp=p: self._update_row(pp))
 
         self.progress.set(0)
-        self.log_status(f"Проверка {total} прокси, потоков: {threads}")
 
-        self.executor = ThreadPoolExecutor(max_workers=max(1, threads), thread_name_prefix="check")
-        self.running_futures = []
+        # Стадия 1 крутится в отдельном фоновом потоке, чтобы UI оставался
+        # отзывчивым (а потом в нём же запускается стадия 2 через executor).
+        def stage1_then_stage2() -> None:
+            tcp_timeout = max(2.0, min(timeout / 3, 4.0))
+            self._post(lambda: self.log_status(
+                f"Стадия 1/2: TCP-предчек {total} хостов (по {tcp_timeout:.0f}с)…"
+            ))
 
-        def task(p: Proxy) -> None:
+            survivors: list[Proxy] = []
+            tcp_done = {"n": 0}
+            tcp_lock = threading.Lock()
+
+            def tcp_probe(p: Proxy) -> None:
+                if self.cancel_event.is_set():
+                    return
+                ok, why = _tcp_reachable(p.address, p.port, tcp_timeout)
+                with tcp_lock:
+                    tcp_done["n"] += 1
+                    n = tcp_done["n"]
+                    if ok:
+                        survivors.append(p)
+                if not ok:
+                    p.status = STATUS_FAIL
+                    p.ping_ms = -1
+                    p.error = why
+                    self._post(lambda pp=p: self._update_row(pp))
+                if n % 50 == 0 or n == total:
+                    progress = 0.5 * n / max(1, total)  # стадия 1 — первые 50%
+                    self._post(lambda pr=progress: self.progress.set(pr))
+                    self._post(lambda nn=n, t=total, sv=len(survivors): self.log_status(
+                        f"TCP-предчек: {nn}/{t} (живых: {sv})"
+                    ))
+
+            with ThreadPoolExecutor(max_workers=64, thread_name_prefix="tcp") as tcp_ex:
+                list(tcp_ex.map(tcp_probe, proxies))
+
             if self.cancel_event.is_set():
-                p.status = STATUS_PENDING
-                self._post(lambda pp=p: self._update_row(pp))
+                self._post(finalize)
                 return
-            res = check_proxy(p, xray_path, timeout, test_url, self.cancel_event)
-            p.status = STATUS_OK if res.ok else STATUS_FAIL
-            p.ping_ms = res.ping_ms
-            p.error = res.error
-            done["n"] += 1
-            n = done["n"]
 
-            def apply() -> None:
-                self._update_row(p)
-                self.progress.set(n / max(1, total))
-                self.log_status(f"Проверка: {n}/{total}  ({p.short_addr()} → {p.status})")
-                self._update_counter()
+            self._post(lambda sv=len(survivors), t=total: self.log_status(
+                f"Стадия 2/2: полный xray-чек {sv} живых хостов из {t} (потоков: {threads})"
+            ))
+            self._post(self._update_counter)
 
-            self._post(apply)
+            # Стадия 2 — реальный xray-чек только для выживших.
+            self.executor = ThreadPoolExecutor(
+                max_workers=max(1, threads), thread_name_prefix="check"
+            )
+            self.running_futures = []
 
-        for p in proxies:
-            fut = self.executor.submit(task, p)
-            self.running_futures.append(fut)
+            def task(p: Proxy) -> None:
+                if self.cancel_event.is_set():
+                    p.status = STATUS_PENDING
+                    self._post(lambda pp=p: self._update_row(pp))
+                    return
+                res = check_proxy(p, xray_path, timeout, test_url, self.cancel_event)
+                p.status = STATUS_OK if res.ok else STATUS_FAIL
+                p.ping_ms = res.ping_ms
+                p.error = res.error
+                done["n"] += 1
+                n = done["n"]
 
-        # Поток-наблюдатель: дождёмся завершения и сбросим флаги
-        def waiter() -> None:
+                def apply() -> None:
+                    self._update_row(p)
+                    # стадия 2 — оставшиеся 50% прогресса
+                    self.progress.set(0.5 + 0.5 * n / max(1, len(survivors)))
+                    self.log_status(
+                        f"Проверка: {n}/{len(survivors)}  ({p.short_addr()} → {p.status})"
+                    )
+                    self._update_counter()
+
+                self._post(apply)
+
+            for p in survivors:
+                fut = self.executor.submit(task, p)
+                self.running_futures.append(fut)
+
             for fut in self.running_futures:
                 try:
                     fut.result()
                 except Exception:  # noqa: BLE001
                     pass
 
-            def finalize() -> None:
-                self.is_checking = False
-                self.executor = None
-                # Перерисовка с новой сортировкой: рабочие IPv6 → рабочие IPv4
-                # → проверяющиеся → нерабочие, по возрастанию пинга.
-                self._refresh_table()
-                if self.cancel_event.is_set():
-                    self.log_status("Проверка остановлена.")
-                else:
-                    ok = sum(1 for p in self.proxies.values() if p.status == STATUS_OK)
-                    self.log_status(f"Проверка завершена. Рабочих: {ok}")
-                self.after(1500, lambda: self.progress.set(0))
-
             self._post(finalize)
 
-        threading.Thread(target=waiter, daemon=True).start()
+        def finalize() -> None:
+            self.is_checking = False
+            self.executor = None
+            # Перерисовка с новой сортировкой: рабочие IPv6 → рабочие IPv4
+            # → проверяющиеся → нерабочие, по возрастанию пинга.
+            self._refresh_table()
+            if self.cancel_event.is_set():
+                self.log_status("Проверка остановлена.")
+            else:
+                ok = sum(1 for p in self.proxies.values() if p.status == STATUS_OK)
+                # Группируем ошибки по префиксу до двоеточия (`tcp:`,
+                # `tls:`, `http:`, `xray:`, `dns:`, …) — пользователю
+                # сразу видно, ЧТО валится. Показываем топ-5 категорий.
+                cats: dict[str, int] = {}
+                for p in self.proxies.values():
+                    if p.status == STATUS_FAIL and p.error:
+                        cat = p.error.split(":", 1)[0].strip() or "?"
+                        cats[cat] = cats.get(cat, 0) + 1
+                if cats:
+                    top = sorted(cats.items(), key=lambda x: -x[1])[:5]
+                    breakdown = ", ".join(f"{k}: {v}" for k, v in top)
+                    self.log_status(
+                        f"Проверка завершена. Рабочих: {ok}. Причины фейлов: {breakdown}"
+                    )
+                else:
+                    self.log_status(f"Проверка завершена. Рабочих: {ok}")
+            self.after(1500, lambda: self.progress.set(0))
+
+        # Старт стадии 1 в фоне.
+        threading.Thread(target=stage1_then_stage2, daemon=True, name="stage1").start()
 
     # ------------------------------------------------------------ Авто-обновление
     def _schedule_auto_refresh(self) -> None:
