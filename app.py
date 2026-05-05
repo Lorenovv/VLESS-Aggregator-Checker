@@ -156,15 +156,16 @@ DEFAULT_TG_CHANNELS: list[str] = [
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "xray_path": "",                  # путь к бинарнику xray (если пусто — ищем в PATH)
-    # Таймаут одной HTTP-проверки. 8 сек оказалось мало: VLESS+CDN+TLS
-    # handshake часто не успевает уложиться, особенно через медленный
-    # IPv6 path. 12 сек даёт большинству живых нод шанс ответить.
-    "timeout_sec": 12,
-    # Параллельность чека. 20 одновременно стартующих xray-инстансов на
-    # обычной машине — гонка за ресурсами и фолс-фейлы по таймауту;
-    # 8 — компромисс между скоростью и стабильностью.
-    "threads": 8,
+    # Таймаут одной HTTP-проверки. 8 сек — TCP-предчек уже подтверждает
+    # достижимость, рабочим VLESS-нодам обычно достаточно 2-3 сек, 8 —
+    # запас для медленных CDN-fronted узлов.
+    "timeout_sec": 8,
+    # Параллельность xray-чека. 16 хорошо ложится на любую современную
+    # машину (xray-инстансы съедают ~30-50 МБ каждый, 16 = ~0.5-0.8 ГБ).
+    "threads": 16,
     "test_url": "http://cp.cloudflare.com/",
+    # Быстрая проверка: сколько nod проверять в quick-режиме.
+    "quick_check_top_n": 1500,
     "auto_refresh_min": 0,             # 0 = выключено, иначе минут между авто-обновлениями
     "ipv6_only": False,
     "telegram": {
@@ -1133,6 +1134,12 @@ class App(ctk.CTk):
         )
         self.btn_check.pack(fill="x", padx=12, pady=4)
 
+        self.btn_quick = ctk.CTkButton(
+            side, text="⚡  Быстрая проверка", command=self.action_quick_check, height=36,
+            fg_color="#1f5e7a", hover_color="#174a5e"
+        )
+        self.btn_quick.pack(fill="x", padx=12, pady=2)
+
         self.btn_stop = ctk.CTkButton(
             side, text="⏹  Стоп", command=self.action_stop, height=36, fg_color="#7a1f1f", hover_color="#5c1717"
         )
@@ -1344,6 +1351,65 @@ class App(ctk.CTk):
         self.cancel_event.clear()
         self.is_checking = True
         self._start_checks(proxies, xray)
+
+    def action_quick_check(self) -> None:
+        """Быстрая проверка: берёт top-N (по умолчанию 1500) прокси с
+        приоритетом IPv6 + уникальные `host:port` + ещё непроверенные.
+        На больших списках (10k+) даёт результат за 10–15 минут вместо
+        2 часов, при этом обычно ловит большинство живых нод (т.к. среди
+        тысяч дубликатов одного и того же CDN-фронта работают они либо
+        все, либо никто)."""
+        if self.is_checking:
+            self.log_status("Проверка уже идёт.")
+            return
+        if not self.proxies:
+            self.log_status("Список пуст. Сначала обновите источники.")
+            return
+        xray = discover_xray(self.settings.get("xray_path", ""))
+        if not xray:
+            messagebox.showwarning(
+                APP_NAME,
+                "Не найден Xray-core.\n\n"
+                "Скачайте релиз с https://github.com/XTLS/Xray-core/releases\n"
+                "и укажите путь к бинарнику в настройках (⚙ Настройки).",
+                parent=self,
+            )
+            return
+
+        top_n = max(50, int(self.settings.get("quick_check_top_n", 1500)))
+
+        # Сортировка для отбора:
+        #  1) IPv6 раньше IPv4
+        #  2) ещё не проверенные раньше уже проверенных
+        #  3) уже рабочие — в самом конце (их перепроверять не надо в quick)
+        all_proxies = list(self.proxies.values())
+        order_status = {STATUS_PENDING: 0, STATUS_CHECKING: 1, STATUS_FAIL: 2, STATUS_OK: 3}
+        all_proxies.sort(key=lambda p: (
+            0 if p.is_ipv6 else 1,
+            order_status.get(p.status, 9),
+        ))
+
+        # Дедуп по (host, port) — берём первого из каждой группы.
+        # Это резко увеличивает «полезную плотность» выборки: 1500 разных
+        # хостов вместо 1500 копий одного и того же `chatgpt.com:443`.
+        seen: set[tuple[str, int]] = set()
+        selected: list[Proxy] = []
+        for p in all_proxies:
+            key = (p.address, p.port)
+            if key in seen:
+                continue
+            seen.add(key)
+            selected.append(p)
+            if len(selected) >= top_n:
+                break
+
+        self.cancel_event.clear()
+        self.is_checking = True
+        self.log_status(
+            f"Быстрая проверка: {len(selected)} из {len(all_proxies)} "
+            f"(IPv6 + уникальные host:port в приоритете)"
+        )
+        self._start_checks(selected, xray)
 
     def action_stop(self) -> None:
         if self.is_scraping or self.is_checking:
@@ -1718,11 +1784,15 @@ class App(ctk.CTk):
         2) полный xray-чек (`threads` потоков) только для тех, кто прошёл
            TCP. Так на 11k прокси экономится десятки минут.
         """
-        timeout = float(self.settings.get("timeout_sec", 12))
-        threads = int(self.settings.get("threads", 8))
+        timeout = float(self.settings.get("timeout_sec", 8))
+        threads = int(self.settings.get("threads", 16))
         test_url = str(self.settings.get("test_url") or DEFAULT_SETTINGS["test_url"])
         total = len(proxies)
-        done = {"n": 0}
+        done = {"n": 0, "ok": 0}
+        # Сглаженное среднее времени одного xray-чека для расчёта ETA.
+        # Используем экспоненциальное скользящее (EMA) — устойчиво к
+        # выбросам и не требует хранить историю.
+        ema = {"avg": float(timeout) * 0.7}
 
         # Помечаем все как "checking"
         for p in proxies:
@@ -1732,48 +1802,76 @@ class App(ctk.CTk):
 
         self.progress.set(0)
 
+        def fmt_eta(seconds: float) -> str:
+            if seconds < 0 or seconds > 24 * 3600:
+                return "?"
+            s = int(seconds)
+            if s < 60:
+                return f"{s}с"
+            m = s // 60
+            if m < 60:
+                return f"{m}м {s % 60}с"
+            return f"{m // 60}ч {m % 60}м"
+
         # Стадия 1 крутится в отдельном фоновом потоке, чтобы UI оставался
         # отзывчивым (а потом в нём же запускается стадия 2 через executor).
         def stage1_then_stage2() -> None:
-            tcp_timeout = max(2.0, min(timeout / 3, 4.0))
-            self._post(lambda: self.log_status(
-                f"Стадия 1/2: TCP-предчек {total} хостов (по {tcp_timeout:.0f}с)…"
+            # TCP 2с: всё, что отвечает медленнее, для целей VLESS-чека
+            # практически бесполезно (и обычно это уже мёртвые хосты).
+            tcp_timeout = 2.0
+
+            # Дедуп TCP-проб: если 50 конфигов смотрят в один и тот же
+            # `host:port` (типичная история на SoliSpirit/barry-far —
+            # сотни вариантов одной и той же ноды с разными uuid/path),
+            # делаем один TCP-пробинг и фан-аутом раздаём результат.
+            host_port_groups: dict[tuple[str, int], list[Proxy]] = {}
+            for p in proxies:
+                host_port_groups.setdefault((p.address, p.port), []).append(p)
+            unique_targets = list(host_port_groups.keys())
+
+            self._post(lambda u=len(unique_targets), t=total: self.log_status(
+                f"Стадия 1/2: TCP-предчек {u} уникальных хостов (из {t} прокси, по 2с)…"
             ))
 
             survivors: list[Proxy] = []
             tcp_done = {"n": 0}
             tcp_lock = threading.Lock()
+            unique_n = len(unique_targets)
 
-            def tcp_probe(p: Proxy) -> None:
+            def tcp_probe_target(target: tuple[str, int]) -> None:
                 if self.cancel_event.is_set():
                     return
-                ok, why = _tcp_reachable(p.address, p.port, tcp_timeout)
+                host, port = target
+                ok, why = _tcp_reachable(host, port, tcp_timeout)
+                group = host_port_groups[target]
                 with tcp_lock:
                     tcp_done["n"] += 1
                     n = tcp_done["n"]
                     if ok:
-                        survivors.append(p)
+                        survivors.extend(group)
                 if not ok:
-                    p.status = STATUS_FAIL
-                    p.ping_ms = -1
-                    p.error = why
-                    self._post(lambda pp=p: self._update_row(pp))
-                if n % 50 == 0 or n == total:
-                    progress = 0.5 * n / max(1, total)  # стадия 1 — первые 50%
+                    for p in group:
+                        p.status = STATUS_FAIL
+                        p.ping_ms = -1
+                        p.error = why
+                        self._post(lambda pp=p: self._update_row(pp))
+                if n % 25 == 0 or n == unique_n:
+                    progress = 0.5 * n / max(1, unique_n)  # стадия 1 — первые 50%
                     self._post(lambda pr=progress: self.progress.set(pr))
-                    self._post(lambda nn=n, t=total, sv=len(survivors): self.log_status(
-                        f"TCP-предчек: {nn}/{t} (живых: {sv})"
+                    self._post(lambda nn=n, u=unique_n, sv=len(survivors): self.log_status(
+                        f"TCP-предчек: {nn}/{u} уник. хостов (живых прокси: {sv})"
                     ))
 
             with ThreadPoolExecutor(max_workers=64, thread_name_prefix="tcp") as tcp_ex:
-                list(tcp_ex.map(tcp_probe, proxies))
+                list(tcp_ex.map(tcp_probe_target, unique_targets))
 
             if self.cancel_event.is_set():
                 self._post(finalize)
                 return
 
-            self._post(lambda sv=len(survivors), t=total: self.log_status(
-                f"Стадия 2/2: полный xray-чек {sv} живых хостов из {t} (потоков: {threads})"
+            survivors_n = len(survivors)
+            self._post(lambda sv=survivors_n, t=total: self.log_status(
+                f"Стадия 2/2: xray-чек {sv} живых прокси из {t} (потоков: {threads})"
             ))
             self._post(self._update_counter)
 
@@ -1782,25 +1880,35 @@ class App(ctk.CTk):
                 max_workers=max(1, threads), thread_name_prefix="check"
             )
             self.running_futures = []
+            stage2_start = time.time()
 
             def task(p: Proxy) -> None:
                 if self.cancel_event.is_set():
                     p.status = STATUS_PENDING
                     self._post(lambda pp=p: self._update_row(pp))
                     return
+                t0 = time.time()
                 res = check_proxy(p, xray_path, timeout, test_url, self.cancel_event)
+                dur = time.time() - t0
                 p.status = STATUS_OK if res.ok else STATUS_FAIL
                 p.ping_ms = res.ping_ms
                 p.error = res.error
                 done["n"] += 1
+                if res.ok:
+                    done["ok"] += 1
                 n = done["n"]
+                # EMA(α=0.05) — обновляем оценку среднего времени проверки.
+                ema["avg"] = ema["avg"] * 0.95 + dur * 0.05
+                # ETA = (оставшиеся проверки) × среднее время / параллельность
+                remaining = survivors_n - n
+                eta_seconds = remaining * ema["avg"] / max(1, threads)
 
                 def apply() -> None:
                     self._update_row(p)
-                    # стадия 2 — оставшиеся 50% прогресса
-                    self.progress.set(0.5 + 0.5 * n / max(1, len(survivors)))
+                    self.progress.set(0.5 + 0.5 * n / max(1, survivors_n))
                     self.log_status(
-                        f"Проверка: {n}/{len(survivors)}  ({p.short_addr()} → {p.status})"
+                        f"Проверка: {n}/{survivors_n}  рабочих: {done['ok']}  "
+                        f"ETA: {fmt_eta(eta_seconds)}  ({p.short_addr()} → {p.status})"
                     )
                     self._update_counter()
 
