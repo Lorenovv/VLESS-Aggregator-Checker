@@ -346,6 +346,36 @@ class Proxy:
                 pass
         return f"{addr}:{self.port}"
 
+    def export_url(self) -> str:
+        """URL для экспорта: то же самое VLESS-URL, но с тегом `[IPv6]` /
+        `[IPv4]` в начале лейбла (фрагмент после `#`). После импорта
+        в любом клиенте (NekoBox/Hiddify/v2rayN/Streisand) сразу видно,
+        IPv6 это нода или нет, без необходимости лезть в адрес.
+        Если is_ipv6 ещё не определён — возвращаем исходный url."""
+        if self.is_ipv6 is None:
+            return self.url
+        try:
+            split = urllib.parse.urlsplit(self.url)
+        except Exception:
+            return self.url
+        # urlsplit.fragment уже декодирован, но в большинстве клиентов
+        # лейбл живёт как percent-encoded UTF-8. Аккуратно: декодируем,
+        # подставляем тег в начало, заново кодируем.
+        try:
+            label = urllib.parse.unquote(split.fragment) if split.fragment else self.name
+        except Exception:
+            label = self.name
+        tag = "[IPv6] " if self.is_ipv6 else "[IPv4] "
+        # Если тег уже стоит в начале — не дублируем (на случай повторного
+        # экспорта).
+        if label.startswith("[IPv6] ") or label.startswith("[IPv4] "):
+            label = label.split("] ", 1)[1] if "] " in label else label
+        new_label = tag + label
+        new_fragment = urllib.parse.quote(new_label, safe="")
+        return urllib.parse.urlunsplit((
+            split.scheme, split.netloc, split.path, split.query, new_fragment
+        ))
+
 
 def _try_b64decode(text: str) -> str | None:
     """Возвращает декодированный текст, если `text` похож на base64 и
@@ -1461,19 +1491,31 @@ class App(ctk.CTk):
         self.log_status(f"Из файла импортировано: {added} новых.")
 
     def action_copy_working(self) -> None:
-        working = [p.url for p in self.proxies.values() if p.status == STATUS_OK]
+        working = [p.export_url() for p in self.proxies.values() if p.status == STATUS_OK]
         if not working:
             self.log_status("Рабочих прокси нет.")
             return
         self.clipboard_clear()
         self.clipboard_append("\n".join(working))
-        self.log_status(f"Скопировано {len(working)} рабочих ссылок в буфер.")
+        v6 = sum(1 for p in self.proxies.values() if p.status == STATUS_OK and p.is_ipv6)
+        self.log_status(
+            f"Скопировано {len(working)} рабочих ссылок в буфер "
+            f"(IPv6: {v6}, IPv4: {len(working) - v6}; теги [IPv6]/[IPv4] в имени)."
+        )
 
     def action_save_working(self) -> None:
-        working = [p.url for p in self.proxies.values() if p.status == STATUS_OK]
-        if not working:
+        working_proxies = [p for p in self.proxies.values() if p.status == STATUS_OK]
+        if not working_proxies:
             self.log_status("Рабочих прокси нет — нечего сохранять.")
             return
+        # Сортировка экспорта совпадает с сортировкой таблицы:
+        # IPv6 первыми, внутри — по возрастанию пинга. После импорта в
+        # клиент пользователь сразу видит IPv6 сверху списка.
+        working_proxies.sort(key=lambda p: (
+            0 if p.is_ipv6 else 1,
+            p.ping_ms if p.ping_ms >= 0 else 10**9,
+        ))
+        working = [p.export_url() for p in working_proxies]
         path = filedialog.asksaveasfilename(
             title="Сохранить рабочие VLESS",
             defaultextension=".txt",
@@ -1487,7 +1529,11 @@ class App(ctk.CTk):
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write("\n".join(working))
-            self.log_status(f"Сохранено {len(working)} ссылок в {path}")
+            v6 = sum(1 for p in working_proxies if p.is_ipv6)
+            self.log_status(
+                f"Сохранено {len(working)} ссылок в {path} "
+                f"(IPv6: {v6}, IPv4: {len(working) - v6}; теги [IPv6]/[IPv4] в имени)."
+            )
         except Exception as exc:
             messagebox.showerror(APP_NAME, f"Не удалось сохранить: {exc}", parent=self)
 
