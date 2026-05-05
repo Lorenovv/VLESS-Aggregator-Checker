@@ -71,6 +71,17 @@ try:
 except Exception:  # pragma: no cover
     HAS_DNS = False
 
+# PySocks нужен для requests, чтобы тот умел ходить через socks5h://.
+# Без него каждый проксичек падает с `InvalidSchema: Missing dependencies
+# for SOCKS support` — и пользователь видит «0 рабочих» из любого
+# количества прокси, не понимая почему. Импорт здесь нужен ещё и для
+# того, чтобы PyInstaller подхватил пакет в автоматическую сборку exe.
+try:
+    import socks  # type: ignore  # noqa: F401  (нужен для requests[socks])
+    HAS_SOCKS = True
+except Exception:  # pragma: no cover
+    HAS_SOCKS = False
+
 # Telethon — опционально, только если пользователь включит Telegram-скрапинг.
 try:
     from telethon.sync import TelegramClient  # type: ignore  # noqa: F401
@@ -93,15 +104,47 @@ SOURCES_PATH = os.path.join(APP_DIR, "sources.json")
 TEMP_DIR = os.path.join(APP_DIR, "temp_xray_configs")
 EXPORT_DEFAULT = os.path.join(APP_DIR, "working_vless.txt")
 
-# Подписки по умолчанию — несколько широко известных публичных коллекторов.
+# Подписки по умолчанию — широкий набор активных публичных коллекторов.
+# Каждая ссылка проверена на актуальность и количество vless-конфигов.
 # Пользователь может добавлять/удалять их в настройках.
 DEFAULT_SOURCES: list[str] = [
-    "https://raw.githubusercontent.com/yebekhe/TVC/main/subscriptions/xray/normal/vless",
-    "https://raw.githubusercontent.com/MhdiTaheri/V2rayCollector/main/sub/Mix/mix.txt",
-    "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt",
-    "https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/v2rayfree.txt",
-    "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Vless.txt",
+    # Большие сводные подписки (тысячи конфигов).
+    "https://raw.githubusercontent.com/mheidari98/.proxy/main/vless",
+    "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/vless.txt",
+    "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/Splitted-By-Protocol/vless.txt",
+    "https://raw.githubusercontent.com/barry-far/V2ray-Config/main/Splitted-By-Protocol/vless.txt",
+    "https://raw.githubusercontent.com/Surfboardv2ray/TGParse/main/python/vless",
+    # Средние коллекторы.
+    "https://raw.githubusercontent.com/HosseinKoofi/GO_V2rayCollector/main/mixed_iran.txt",
+    "https://raw.githubusercontent.com/MhdiTaheri/V2rayCollector/main/sub/vless",
+    "https://raw.githubusercontent.com/itsyebekhe/PSG/main/subscriptions/xray/normal/vless",
+    "https://raw.githubusercontent.com/MhdiTaheri/V2rayCollector_Py/main/sub/Mix/mix.txt",
+    "https://raw.githubusercontent.com/ndsphonemy/proxy-sub/main/speed.txt",
+    # Меньшие, но часто живые подборки — добавляют разнообразия источников.
+    "https://raw.githubusercontent.com/Roosterkid/openproxylist/main/V2RAY_RAW.txt",
+    "https://raw.githubusercontent.com/Kwinshadow/TelegramV2rayCollector/main/sublinks/vless.txt",
+    "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt",
 ]
+
+# Карта миграций: старые URL, которые больше не отвечают (404 / переименование
+# репозитория / переезд файла) → новый адрес или None, если замены нет.
+# Применяется при загрузке sources.json, чтобы у пользователей со старым
+# конфигом сломанные ссылки автоматически заменялись на рабочие.
+SOURCE_MIGRATIONS: dict[str, str | None] = {
+    "https://raw.githubusercontent.com/yebekhe/TVC/main/subscriptions/xray/normal/vless":
+        "https://raw.githubusercontent.com/itsyebekhe/PSG/main/subscriptions/xray/normal/vless",
+    "https://raw.githubusercontent.com/MhdiTaheri/V2rayCollector/main/sub/Mix/mix.txt":
+        "https://raw.githubusercontent.com/MhdiTaheri/V2rayCollector/main/sub/vless",
+    "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Vless.txt":
+        "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/Protocols/vless.txt",
+    # Файл удалён из репозитория, в нём остались только per-source списки.
+    "https://raw.githubusercontent.com/Barabama/FreeNodes/main/nodes/v2rayfree.txt": None,
+    # All_Configs_Sub.txt — те же конфиги, что и в Splitted-By-Protocol/vless.txt
+    # плюс мусор других протоколов; заменяем на vless-конкретный путь, чтобы
+    # экономить трафик и время AAAA-резолвинга.
+    "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt":
+        "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/Splitted-By-Protocol/vless.txt",
+}
 
 DEFAULT_TG_CHANNELS: list[str] = [
     "v2rayng_proxy",
@@ -113,9 +156,16 @@ DEFAULT_TG_CHANNELS: list[str] = [
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "xray_path": "",                  # путь к бинарнику xray (если пусто — ищем в PATH)
-    "timeout_sec": 8,                  # таймаут одной проверки
-    "threads": 20,                     # количество потоков проверки
+    # Таймаут одной HTTP-проверки. 8 сек — TCP-предчек уже подтверждает
+    # достижимость, рабочим VLESS-нодам обычно достаточно 2-3 сек, 8 —
+    # запас для медленных CDN-fronted узлов.
+    "timeout_sec": 8,
+    # Параллельность xray-чека. 16 хорошо ложится на любую современную
+    # машину (xray-инстансы съедают ~30-50 МБ каждый, 16 = ~0.5-0.8 ГБ).
+    "threads": 16,
     "test_url": "http://cp.cloudflare.com/",
+    # Быстрая проверка: сколько nod проверять в quick-режиме.
+    "quick_check_top_n": 1500,
     "auto_refresh_min": 0,             # 0 = выключено, иначе минут между авто-обновлениями
     "ipv6_only": False,
     "telegram": {
@@ -199,13 +249,46 @@ def save_settings(settings: dict) -> None:
     save_json(SETTINGS_PATH, settings)
 
 
+def _migrate_sources(sources: list[str]) -> tuple[list[str], bool]:
+    """Заменяет известные сломанные URL на актуальные согласно SOURCE_MIGRATIONS.
+    Возвращает (новый_список, было_ли_изменение)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    changed = False
+    for src in sources:
+        if src in SOURCE_MIGRATIONS:
+            replacement = SOURCE_MIGRATIONS[src]
+            changed = True
+            if replacement is None:
+                log(f"Источник {src} больше не существует — удалён из настроек")
+                continue
+            log(f"Источник {src} переехал → {replacement}")
+            if replacement in seen:
+                continue
+            out.append(replacement)
+            seen.add(replacement)
+        else:
+            if src in seen:
+                continue
+            out.append(src)
+            seen.add(src)
+    return out, changed
+
+
 def load_sources() -> list[str]:
     data = load_json(SOURCES_PATH, None)
     if data is None:
         save_json(SOURCES_PATH, DEFAULT_SOURCES)
         return list(DEFAULT_SOURCES)
     if isinstance(data, list):
-        return [str(x).strip() for x in data if str(x).strip()]
+        sources = [str(x).strip() for x in data if str(x).strip()]
+        sources, migrated = _migrate_sources(sources)
+        if not sources:
+            sources = list(DEFAULT_SOURCES)
+            migrated = True
+        if migrated:
+            save_json(SOURCES_PATH, sources)
+        return sources
     return list(DEFAULT_SOURCES)
 
 
@@ -263,12 +346,51 @@ class Proxy:
                 pass
         return f"{addr}:{self.port}"
 
+    def export_url(self) -> str:
+        """URL для экспорта: то же самое VLESS-URL, но с тегом `[IPv6]` /
+        `[IPv4]` в начале лейбла (фрагмент после `#`). После импорта
+        в любом клиенте (NekoBox/Hiddify/v2rayN/Streisand) сразу видно,
+        IPv6 это нода или нет, без необходимости лезть в адрес.
+        Если is_ipv6 ещё не определён — возвращаем исходный url."""
+        if self.is_ipv6 is None:
+            return self.url
+        try:
+            split = urllib.parse.urlsplit(self.url)
+        except Exception:
+            return self.url
+        # urlsplit.fragment уже декодирован, но в большинстве клиентов
+        # лейбл живёт как percent-encoded UTF-8. Аккуратно: декодируем,
+        # подставляем тег в начало, заново кодируем.
+        try:
+            label = urllib.parse.unquote(split.fragment) if split.fragment else self.name
+        except Exception:
+            label = self.name
+        tag = "[IPv6] " if self.is_ipv6 else "[IPv4] "
+        # Если тег уже стоит в начале — не дублируем (на случай повторного
+        # экспорта).
+        if label.startswith("[IPv6] ") or label.startswith("[IPv4] "):
+            label = label.split("] ", 1)[1] if "] " in label else label
+        new_label = tag + label
+        new_fragment = urllib.parse.quote(new_label, safe="")
+        return urllib.parse.urlunsplit((
+            split.scheme, split.netloc, split.path, split.query, new_fragment
+        ))
+
 
 def _try_b64decode(text: str) -> str | None:
     """Возвращает декодированный текст, если `text` похож на base64 и
-    содержит после декодирования хотя бы одну vless-ссылку."""
+    содержит после декодирования хотя бы одну vless-ссылку.
+
+    Корректный base64 — всегда ASCII, поэтому если в тексте есть не-ASCII
+    символы (emoji, кириллица в заголовках подписки и т. п.) — это уже не
+    base64-подписка, и пытаться декодировать не нужно. Без этой проверки
+    `base64.b64decode` бросает `ValueError` на не-ASCII входе и роняет
+    всю процедуру скрапинга.
+    """
     stripped = text.strip()
     if len(stripped) < 24:
+        return None
+    if not stripped.isascii():
         return None
     # допускаем url-safe и обычный base64 без подложек
     cleaned = re.sub(r"\s+", "", stripped)
@@ -276,7 +398,7 @@ def _try_b64decode(text: str) -> str | None:
     for variant in (padded, padded.replace("-", "+").replace("_", "/")):
         try:
             decoded = base64.b64decode(variant, validate=False).decode("utf-8", errors="replace")
-        except (binascii.Error, UnicodeDecodeError):
+        except (binascii.Error, UnicodeDecodeError, ValueError):
             continue
         if "vless://" in decoded.lower():
             return decoded
@@ -398,7 +520,10 @@ def extract_vless_from_text(text: str, source: str = "") -> list[Proxy]:
 # =============================================================================
 
 def scrape_url(url: str, timeout: float = 15.0) -> list[Proxy]:
-    """Скачивает подписку и достаёт из неё все vless-ссылки."""
+    """Скачивает подписку и достаёт из неё все vless-ссылки.
+    Любые ошибки сети/парсинга для одного источника не должны ронять
+    общую процедуру обновления — поэтому всё, что упало, логируется и
+    возвращается пустой список."""
     headers = {"User-Agent": f"{APP_NAME}/{APP_VERSION}"}
     try:
         resp = requests.get(url, timeout=timeout, headers=headers)
@@ -406,7 +531,11 @@ def scrape_url(url: str, timeout: float = 15.0) -> list[Proxy]:
     except Exception as exc:
         log(f"Источник {url} недоступен: {exc}")
         return []
-    return extract_vless_from_text(resp.text, source=url)
+    try:
+        return extract_vless_from_text(resp.text, source=url)
+    except Exception as exc:
+        log(f"Источник {url} не распарсился: {exc}")
+        return []
 
 
 def scrape_telegram(
@@ -659,6 +788,33 @@ def _wait_socks_ready(port: int, timeout: float) -> bool:
     return False
 
 
+def _tcp_reachable(host: str, port: int, timeout: float) -> tuple[bool, str]:
+    """Быстрый TCP-предчек: пытается открыть TCP-соединение к (host, port).
+    Возвращает (reachable, error_category). Категории — короткие (`tcp: …`,
+    `dns: …`), их позже можно агрегировать в статус-бар после проверки.
+
+    Идея: подавляющее большинство публичных VLESS-нод мертвы. Запускать
+    xray на каждой — медленно (2-3 сек на старт + JSON + socks). А TCP
+    connect занимает максимум `timeout` сек и параллелится без проблем,
+    так что 80-95% дохлых нод можно отсеять быстро, оставив xray-чек
+    только живым.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True, ""
+    except socket.gaierror:
+        return False, "dns: не резолвится"
+    except (TimeoutError, socket.timeout):
+        return False, "tcp: таймаут"
+    except ConnectionRefusedError:
+        return False, "tcp: connection refused"
+    except OSError as e:
+        msg = str(e).lower()
+        if "unreachable" in msg or "no route" in msg:
+            return False, "tcp: unreachable"
+        return False, f"tcp: errno {e.errno}" if e.errno else "tcp: error"
+
+
 def check_proxy(
     proxy: Proxy,
     xray_path: str,
@@ -666,8 +822,12 @@ def check_proxy(
     test_url: str,
     cancel_event: threading.Event,
 ) -> CheckResult:
-    """Запускает Xray для proxy и делает HTTP-запрос через SOCKS5.
-    Возвращает CheckResult(ok, ping_ms, error)."""
+    """Поднимает Xray для конкретной прокси и делает HTTP-запрос через
+    локальный SOCKS5. Возвращает CheckResult(ok, ping_ms, error).
+    Ошибки разнесены по категориям (`tls:`, `http:`, `xray:`, …),
+    чтобы в статус-баре после проверки можно было показать пользователю,
+    что именно фейлит. TCP-достижимость проверяется заранее на стадии 1
+    в `_start_checks`, сюда долетают только живые на TCP-уровне ноды."""
     if cancel_event.is_set():
         return CheckResult(False, -1, "отменено")
 
@@ -694,8 +854,11 @@ def check_proxy(
             creationflags=creation_flags,
         )
 
-        if not _wait_socks_ready(local_port, min(timeout, 5)):
-            return CheckResult(False, -1, "xray не поднял socks")
+        # xray обычно поднимает socks за 100-500мс, но на медленных Windows
+        # с антивирусом может стартовать до 3-4 сек. Не зависим от
+        # пользовательского timeout — отдельный фиксированный бюджет.
+        if not _wait_socks_ready(local_port, 5.0):
+            return CheckResult(False, -1, "xray: не запустил socks")
 
         if cancel_event.is_set():
             return CheckResult(False, -1, "отменено")
@@ -711,17 +874,32 @@ def check_proxy(
                 allow_redirects=False,
                 headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"},
             )
+        except requests.exceptions.SSLError:
+            return CheckResult(False, -1, "tls: handshake fail")
+        except requests.exceptions.ConnectTimeout:
+            return CheckResult(False, -1, "http: connect timeout")
+        except requests.exceptions.ReadTimeout:
+            return CheckResult(False, -1, "http: read timeout")
+        except requests.exceptions.InvalidSchema:
+            # InvalidSchema на socks5h:// = в окружении нет PySocks.
+            # Это не «прокси сломан», а сборка/окружение. Сообщение должно
+            # быть кричащим, чтобы юзер сразу понял, что делать.
+            return CheckResult(False, -1, "build: PySocks отсутствует — переустановите")
+        except requests.exceptions.ProxyError as exc:
+            # ProxyError обычно значит, что xray поднялся, но прокси-нода
+            # отвалилась после установки socks (TLS/handshake внутри xray).
+            return CheckResult(False, -1, "tunnel: closed")
         except requests.exceptions.RequestException as exc:
-            return CheckResult(False, -1, f"req: {exc.__class__.__name__}")
+            return CheckResult(False, -1, f"http: {exc.__class__.__name__}")
         elapsed_ms = int((time.perf_counter() - start) * 1000)
-        # Принимаем 2xx и 204 (generate_204 / cloudflare).
+        # Принимаем 2xx и 3xx (generate_204 / cp.cloudflare.com и редиректы).
         if 200 <= r.status_code < 400:
             return CheckResult(True, elapsed_ms)
-        return CheckResult(False, elapsed_ms, f"HTTP {r.status_code}")
+        return CheckResult(False, elapsed_ms, f"http: {r.status_code}")
     except FileNotFoundError:
-        return CheckResult(False, -1, "xray binary not found")
+        return CheckResult(False, -1, "xray: бинарник не найден")
     except Exception as exc:
-        return CheckResult(False, -1, f"err: {exc.__class__.__name__}: {exc}")
+        return CheckResult(False, -1, f"err: {exc.__class__.__name__}")
     finally:
         if proc is not None:
             with contextlib.suppress(Exception):
@@ -986,6 +1164,12 @@ class App(ctk.CTk):
         )
         self.btn_check.pack(fill="x", padx=12, pady=4)
 
+        self.btn_quick = ctk.CTkButton(
+            side, text="⚡  Быстрая проверка", command=self.action_quick_check, height=36,
+            fg_color="#1f5e7a", hover_color="#174a5e"
+        )
+        self.btn_quick.pack(fill="x", padx=12, pady=2)
+
         self.btn_stop = ctk.CTkButton(
             side, text="⏹  Стоп", command=self.action_stop, height=36, fg_color="#7a1f1f", hover_color="#5c1717"
         )
@@ -1088,7 +1272,7 @@ class App(ctk.CTk):
         self.tree.heading("name", text="Имя")
         self.tree.heading("addr", text="Адрес:Порт")
         self.tree.heading("proto", text="Сеть / Sec / Flow")
-        self.tree.heading("ping", text="Пинг, мс")
+        self.tree.heading("ping", text="Пинг / Ошибка")
         self.tree.heading("source", text="Источник")
         self.tree.column("status", width=44, anchor="center", stretch=False)
         self.tree.column("name", width=240)
@@ -1198,6 +1382,65 @@ class App(ctk.CTk):
         self.is_checking = True
         self._start_checks(proxies, xray)
 
+    def action_quick_check(self) -> None:
+        """Быстрая проверка: берёт top-N (по умолчанию 1500) прокси с
+        приоритетом IPv6 + уникальные `host:port` + ещё непроверенные.
+        На больших списках (10k+) даёт результат за 10–15 минут вместо
+        2 часов, при этом обычно ловит большинство живых нод (т.к. среди
+        тысяч дубликатов одного и того же CDN-фронта работают они либо
+        все, либо никто)."""
+        if self.is_checking:
+            self.log_status("Проверка уже идёт.")
+            return
+        if not self.proxies:
+            self.log_status("Список пуст. Сначала обновите источники.")
+            return
+        xray = discover_xray(self.settings.get("xray_path", ""))
+        if not xray:
+            messagebox.showwarning(
+                APP_NAME,
+                "Не найден Xray-core.\n\n"
+                "Скачайте релиз с https://github.com/XTLS/Xray-core/releases\n"
+                "и укажите путь к бинарнику в настройках (⚙ Настройки).",
+                parent=self,
+            )
+            return
+
+        top_n = max(50, int(self.settings.get("quick_check_top_n", 1500)))
+
+        # Сортировка для отбора:
+        #  1) IPv6 раньше IPv4
+        #  2) ещё не проверенные раньше уже проверенных
+        #  3) уже рабочие — в самом конце (их перепроверять не надо в quick)
+        all_proxies = list(self.proxies.values())
+        order_status = {STATUS_PENDING: 0, STATUS_CHECKING: 1, STATUS_FAIL: 2, STATUS_OK: 3}
+        all_proxies.sort(key=lambda p: (
+            0 if p.is_ipv6 else 1,
+            order_status.get(p.status, 9),
+        ))
+
+        # Дедуп по (host, port) — берём первого из каждой группы.
+        # Это резко увеличивает «полезную плотность» выборки: 1500 разных
+        # хостов вместо 1500 копий одного и того же `chatgpt.com:443`.
+        seen: set[tuple[str, int]] = set()
+        selected: list[Proxy] = []
+        for p in all_proxies:
+            key = (p.address, p.port)
+            if key in seen:
+                continue
+            seen.add(key)
+            selected.append(p)
+            if len(selected) >= top_n:
+                break
+
+        self.cancel_event.clear()
+        self.is_checking = True
+        self.log_status(
+            f"Быстрая проверка: {len(selected)} из {len(all_proxies)} "
+            f"(IPv6 + уникальные host:port в приоритете)"
+        )
+        self._start_checks(selected, xray)
+
     def action_stop(self) -> None:
         if self.is_scraping or self.is_checking:
             self.log_status("Останавливаю…")
@@ -1248,19 +1491,31 @@ class App(ctk.CTk):
         self.log_status(f"Из файла импортировано: {added} новых.")
 
     def action_copy_working(self) -> None:
-        working = [p.url for p in self.proxies.values() if p.status == STATUS_OK]
+        working = [p.export_url() for p in self.proxies.values() if p.status == STATUS_OK]
         if not working:
             self.log_status("Рабочих прокси нет.")
             return
         self.clipboard_clear()
         self.clipboard_append("\n".join(working))
-        self.log_status(f"Скопировано {len(working)} рабочих ссылок в буфер.")
+        v6 = sum(1 for p in self.proxies.values() if p.status == STATUS_OK and p.is_ipv6)
+        self.log_status(
+            f"Скопировано {len(working)} рабочих ссылок в буфер "
+            f"(IPv6: {v6}, IPv4: {len(working) - v6}; теги [IPv6]/[IPv4] в имени)."
+        )
 
     def action_save_working(self) -> None:
-        working = [p.url for p in self.proxies.values() if p.status == STATUS_OK]
-        if not working:
+        working_proxies = [p for p in self.proxies.values() if p.status == STATUS_OK]
+        if not working_proxies:
             self.log_status("Рабочих прокси нет — нечего сохранять.")
             return
+        # Сортировка экспорта совпадает с сортировкой таблицы:
+        # IPv6 первыми, внутри — по возрастанию пинга. После импорта в
+        # клиент пользователь сразу видит IPv6 сверху списка.
+        working_proxies.sort(key=lambda p: (
+            0 if p.is_ipv6 else 1,
+            p.ping_ms if p.ping_ms >= 0 else 10**9,
+        ))
+        working = [p.export_url() for p in working_proxies]
         path = filedialog.asksaveasfilename(
             title="Сохранить рабочие VLESS",
             defaultextension=".txt",
@@ -1274,7 +1529,11 @@ class App(ctk.CTk):
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write("\n".join(working))
-            self.log_status(f"Сохранено {len(working)} ссылок в {path}")
+            v6 = sum(1 for p in working_proxies if p.is_ipv6)
+            self.log_status(
+                f"Сохранено {len(working)} ссылок в {path} "
+                f"(IPv6: {v6}, IPv4: {len(working) - v6}; теги [IPv6]/[IPv4] в имени)."
+            )
         except Exception as exc:
             messagebox.showerror(APP_NAME, f"Не удалось сохранить: {exc}", parent=self)
 
@@ -1335,31 +1594,41 @@ class App(ctk.CTk):
 
     # ------------------------------------------------------------ Скрапинг (фон)
     def _scrape_worker(self) -> None:
-        """Фоновый поток: тянем все источники и Telegram, добавляем
-        новые прокси в self.proxies через UI-очередь."""
+        """Фоновый поток: тянем все источники и Telegram параллельно,
+        размечаем IPv6 (AAAA-резолвинг) и добавляем новые прокси в
+        self.proxies через UI-очередь."""
         try:
             sources = list(self.sources)
             tg_cfg = self.settings.get("telegram", {})
             tg_enabled = bool(tg_cfg.get("enabled")) and HAS_TELETHON
             total_steps = len(sources) + (1 if tg_enabled else 0)
             done = 0
+            done_lock = threading.Lock()
 
             def step(label: str) -> None:
                 nonlocal done
-                done += 1
-                progress = done / max(1, total_steps)
-                self._post(lambda: self.progress.set(progress))
-                self._post(lambda: self.log_status(label))
+                with done_lock:
+                    done += 1
+                    progress = done / max(1, total_steps)
+                self._post(lambda p=progress: self.progress.set(p))
+                self._post(lambda lbl=label: self.log_status(lbl))
 
             new_proxies: list[Proxy] = []
+            new_lock = threading.Lock()
 
-            for url in sources:
+            def fetch_one(url: str) -> None:
                 if self.cancel_event.is_set():
-                    break
-                self._post(lambda u=url: self.log_status(f"Скачиваю: {u}"))
+                    return
                 fetched = scrape_url(url)
-                new_proxies.extend(fetched)
+                with new_lock:
+                    new_proxies.extend(fetched)
                 step(f"Источник {url}: {len(fetched)} ссылок")
+
+            self._post(lambda n=len(sources): self.log_status(
+                f"Скачиваю {n} источников параллельно…"
+            ))
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as ex:
+                list(ex.map(fetch_one, sources))
 
             if tg_enabled and not self.cancel_event.is_set():
                 self._post(lambda: self.log_status("Telegram: подключаюсь…"))
@@ -1370,31 +1639,55 @@ class App(ctk.CTk):
                     search_keywords=tg_cfg.get("search_keywords", []),
                     messages_limit=int(tg_cfg.get("messages_limit", 200)),
                 )
-                new_proxies.extend(fetched)
+                with new_lock:
+                    new_proxies.extend(fetched)
                 step(f"Telegram: {len(fetched)} ссылок")
 
-            # IPv6-фильтр: если включён — резолвим домены и оставляем только IPv6.
+            # Размечаем IPv6 для всех прокси, у которых статус неизвестен.
+            # Делаем это всегда (а не только при ipv6_only), чтобы:
+            #   * сортировка таблицы могла поднять IPv6-узлы наверх;
+            #   * при включении «Только IPv6» в UI ответ был мгновенным.
+            # Резолвинг параллельный, чтобы тысячи AAAA-запросов не висели час.
+            if new_proxies and not self.cancel_event.is_set():
+                pending = [p for p in new_proxies if p.is_ipv6 is None]
+                if pending:
+                    self._post(lambda n=len(pending): self.log_status(
+                        f"AAAA-резолвинг для приоритезации IPv6 ({n} хостов)…"
+                    ))
+                    seen: dict[str, bool] = {}
+
+                    def resolve_one(p: Proxy) -> None:
+                        if self.cancel_event.is_set():
+                            return
+                        addr = p.address
+                        cached = seen.get(addr)
+                        if cached is not None:
+                            p.is_ipv6 = cached
+                            return
+                        try:
+                            v6 = is_ipv6_host(addr)
+                        except Exception:
+                            v6 = False
+                        seen[addr] = v6
+                        p.is_ipv6 = v6
+
+                    with ThreadPoolExecutor(max_workers=32) as ex:
+                        list(ex.map(resolve_one, pending))
+
+            # Жёсткий IPv6-фильтр (если пользователь включил «Только IPv6»).
             if self.settings.get("ipv6_only") and new_proxies and not self.cancel_event.is_set():
-                self._post(lambda: self.log_status("Фильтрую IPv6 (AAAA-резолвинг)…"))
-                filtered: list[Proxy] = []
-                for p in new_proxies:
-                    if self.cancel_event.is_set():
-                        break
-                    if p.is_ipv6 is True:
-                        filtered.append(p)
-                        continue
-                    if p.is_ipv6 is None:
-                        p.is_ipv6 = is_ipv6_host(p.address)
-                    if p.is_ipv6:
-                        filtered.append(p)
-                new_proxies = filtered
+                new_proxies = [p for p in new_proxies if p.is_ipv6]
 
             # Применяем
             def commit() -> None:
                 added = self._merge_proxies(new_proxies)
+                # Полная перерисовка, чтобы IPv6-приоритет сразу применился.
+                self._refresh_table()
                 self.progress.set(1.0)
+                v6 = sum(1 for p in self.proxies.values() if p.is_ipv6)
                 self.log_status(
-                    f"Готово. Добавлено {added} новых, всего: {len(self.proxies)}."
+                    f"Готово. Добавлено {added} новых, всего: {len(self.proxies)} "
+                    f"(IPv6: {v6})."
                 )
                 self.after(1500, lambda: self.progress.set(0))
 
@@ -1427,11 +1720,22 @@ class App(ctk.CTk):
         self._update_counter()
         return added
 
+    @staticmethod
+    def _ping_or_error(p: Proxy) -> str:
+        """Что показать в колонке «Пинг / Ошибка»: миллисекунды для
+        рабочих, краткую категорию ошибки для нерабочих, прочерк —
+        для ещё не проверенных."""
+        if p.ping_ms >= 0:
+            return f"{p.ping_ms}"
+        if p.status == STATUS_FAIL and p.error:
+            return p.error
+        return "—"
+
     def _insert_row(self, p: Proxy) -> None:
         if not self._proxy_visible(p):
             return
         proto = "/".join(filter(None, [p.network, p.security, p.flow])) or p.network
-        ping_text = f"{p.ping_ms}" if p.ping_ms >= 0 else "—"
+        ping_text = self._ping_or_error(p)
         self.tree.insert(
             "",
             "end",
@@ -1457,7 +1761,7 @@ class App(ctk.CTk):
             self.iid_to_url.pop(p.iid, None)
             return
         proto = "/".join(filter(None, [p.network, p.security, p.flow])) or p.network
-        ping_text = f"{p.ping_ms}" if p.ping_ms >= 0 else "—"
+        ping_text = self._ping_or_error(p)
         self.tree.item(
             p.iid,
             values=(p.status_dot(), p.name, p.short_addr(), proto, ping_text, p.source),
@@ -1490,7 +1794,19 @@ class App(ctk.CTk):
         # Полная перерисовка — простой и надёжный способ.
         self.tree.delete(*self.tree.get_children())
         self.iid_to_url.clear()
-        for p in self.proxies.values():
+        # Сортировка: IPv6 наверху (приоритет), затем «рабочие → проверяющиеся
+        # → ожидающие → нерабочие», затем по возрастанию пинга. Сортируем
+        # стабильно (sorted) — порядок внутри одной группы остаётся как был.
+        status_order = {STATUS_OK: 0, STATUS_CHECKING: 1, STATUS_PENDING: 2, STATUS_FAIL: 3}
+        items = sorted(
+            self.proxies.values(),
+            key=lambda p: (
+                0 if p.is_ipv6 else 1,
+                status_order.get(p.status, 9),
+                p.ping_ms if p.ping_ms >= 0 else 10**9,
+            ),
+        )
+        for p in items:
             self._insert_row(p)
         self._update_counter()
 
@@ -1508,11 +1824,21 @@ class App(ctk.CTk):
 
     # ------------------------------------------------------------ Проверка
     def _start_checks(self, proxies: list[Proxy], xray_path: str) -> None:
+        """Двухстадийная проверка:
+        1) быстрый параллельный TCP-предчек (64 потока) — отсекает дохлые
+           хосты за секунды;
+        2) полный xray-чек (`threads` потоков) только для тех, кто прошёл
+           TCP. Так на 11k прокси экономится десятки минут.
+        """
         timeout = float(self.settings.get("timeout_sec", 8))
-        threads = int(self.settings.get("threads", 20))
+        threads = int(self.settings.get("threads", 16))
         test_url = str(self.settings.get("test_url") or DEFAULT_SETTINGS["test_url"])
         total = len(proxies)
-        done = {"n": 0}
+        done = {"n": 0, "ok": 0}
+        # Сглаженное среднее времени одного xray-чека для расчёта ETA.
+        # Используем экспоненциальное скользящее (EMA) — устойчиво к
+        # выбросам и не требует хранить историю.
+        ema = {"avg": float(timeout) * 0.7}
 
         # Помечаем все как "checking"
         for p in proxies:
@@ -1521,56 +1847,161 @@ class App(ctk.CTk):
             self._post(lambda pp=p: self._update_row(pp))
 
         self.progress.set(0)
-        self.log_status(f"Проверка {total} прокси, потоков: {threads}")
 
-        self.executor = ThreadPoolExecutor(max_workers=max(1, threads), thread_name_prefix="check")
-        self.running_futures = []
+        def fmt_eta(seconds: float) -> str:
+            if seconds < 0 or seconds > 24 * 3600:
+                return "?"
+            s = int(seconds)
+            if s < 60:
+                return f"{s}с"
+            m = s // 60
+            if m < 60:
+                return f"{m}м {s % 60}с"
+            return f"{m // 60}ч {m % 60}м"
 
-        def task(p: Proxy) -> None:
+        # Стадия 1 крутится в отдельном фоновом потоке, чтобы UI оставался
+        # отзывчивым (а потом в нём же запускается стадия 2 через executor).
+        def stage1_then_stage2() -> None:
+            # TCP 2с: всё, что отвечает медленнее, для целей VLESS-чека
+            # практически бесполезно (и обычно это уже мёртвые хосты).
+            tcp_timeout = 2.0
+
+            # Дедуп TCP-проб: если 50 конфигов смотрят в один и тот же
+            # `host:port` (типичная история на SoliSpirit/barry-far —
+            # сотни вариантов одной и той же ноды с разными uuid/path),
+            # делаем один TCP-пробинг и фан-аутом раздаём результат.
+            host_port_groups: dict[tuple[str, int], list[Proxy]] = {}
+            for p in proxies:
+                host_port_groups.setdefault((p.address, p.port), []).append(p)
+            unique_targets = list(host_port_groups.keys())
+
+            self._post(lambda u=len(unique_targets), t=total: self.log_status(
+                f"Стадия 1/2: TCP-предчек {u} уникальных хостов (из {t} прокси, по 2с)…"
+            ))
+
+            survivors: list[Proxy] = []
+            tcp_done = {"n": 0}
+            tcp_lock = threading.Lock()
+            unique_n = len(unique_targets)
+
+            def tcp_probe_target(target: tuple[str, int]) -> None:
+                if self.cancel_event.is_set():
+                    return
+                host, port = target
+                ok, why = _tcp_reachable(host, port, tcp_timeout)
+                group = host_port_groups[target]
+                with tcp_lock:
+                    tcp_done["n"] += 1
+                    n = tcp_done["n"]
+                    if ok:
+                        survivors.extend(group)
+                if not ok:
+                    for p in group:
+                        p.status = STATUS_FAIL
+                        p.ping_ms = -1
+                        p.error = why
+                        self._post(lambda pp=p: self._update_row(pp))
+                if n % 25 == 0 or n == unique_n:
+                    progress = 0.5 * n / max(1, unique_n)  # стадия 1 — первые 50%
+                    self._post(lambda pr=progress: self.progress.set(pr))
+                    self._post(lambda nn=n, u=unique_n, sv=len(survivors): self.log_status(
+                        f"TCP-предчек: {nn}/{u} уник. хостов (живых прокси: {sv})"
+                    ))
+
+            with ThreadPoolExecutor(max_workers=64, thread_name_prefix="tcp") as tcp_ex:
+                list(tcp_ex.map(tcp_probe_target, unique_targets))
+
             if self.cancel_event.is_set():
-                p.status = STATUS_PENDING
-                self._post(lambda pp=p: self._update_row(pp))
+                self._post(finalize)
                 return
-            res = check_proxy(p, xray_path, timeout, test_url, self.cancel_event)
-            p.status = STATUS_OK if res.ok else STATUS_FAIL
-            p.ping_ms = res.ping_ms
-            p.error = res.error
-            done["n"] += 1
-            n = done["n"]
 
-            def apply() -> None:
-                self._update_row(p)
-                self.progress.set(n / max(1, total))
-                self.log_status(f"Проверка: {n}/{total}  ({p.short_addr()} → {p.status})")
-                self._update_counter()
+            survivors_n = len(survivors)
+            self._post(lambda sv=survivors_n, t=total: self.log_status(
+                f"Стадия 2/2: xray-чек {sv} живых прокси из {t} (потоков: {threads})"
+            ))
+            self._post(self._update_counter)
 
-            self._post(apply)
+            # Стадия 2 — реальный xray-чек только для выживших.
+            self.executor = ThreadPoolExecutor(
+                max_workers=max(1, threads), thread_name_prefix="check"
+            )
+            self.running_futures = []
+            stage2_start = time.time()
 
-        for p in proxies:
-            fut = self.executor.submit(task, p)
-            self.running_futures.append(fut)
+            def task(p: Proxy) -> None:
+                if self.cancel_event.is_set():
+                    p.status = STATUS_PENDING
+                    self._post(lambda pp=p: self._update_row(pp))
+                    return
+                t0 = time.time()
+                res = check_proxy(p, xray_path, timeout, test_url, self.cancel_event)
+                dur = time.time() - t0
+                p.status = STATUS_OK if res.ok else STATUS_FAIL
+                p.ping_ms = res.ping_ms
+                p.error = res.error
+                done["n"] += 1
+                if res.ok:
+                    done["ok"] += 1
+                n = done["n"]
+                # EMA(α=0.05) — обновляем оценку среднего времени проверки.
+                ema["avg"] = ema["avg"] * 0.95 + dur * 0.05
+                # ETA = (оставшиеся проверки) × среднее время / параллельность
+                remaining = survivors_n - n
+                eta_seconds = remaining * ema["avg"] / max(1, threads)
 
-        # Поток-наблюдатель: дождёмся завершения и сбросим флаги
-        def waiter() -> None:
+                def apply() -> None:
+                    self._update_row(p)
+                    self.progress.set(0.5 + 0.5 * n / max(1, survivors_n))
+                    self.log_status(
+                        f"Проверка: {n}/{survivors_n}  рабочих: {done['ok']}  "
+                        f"ETA: {fmt_eta(eta_seconds)}  ({p.short_addr()} → {p.status})"
+                    )
+                    self._update_counter()
+
+                self._post(apply)
+
+            for p in survivors:
+                fut = self.executor.submit(task, p)
+                self.running_futures.append(fut)
+
             for fut in self.running_futures:
                 try:
                     fut.result()
                 except Exception:  # noqa: BLE001
                     pass
 
-            def finalize() -> None:
-                self.is_checking = False
-                self.executor = None
-                if self.cancel_event.is_set():
-                    self.log_status("Проверка остановлена.")
-                else:
-                    ok = sum(1 for p in self.proxies.values() if p.status == STATUS_OK)
-                    self.log_status(f"Проверка завершена. Рабочих: {ok}")
-                self.after(1500, lambda: self.progress.set(0))
-
             self._post(finalize)
 
-        threading.Thread(target=waiter, daemon=True).start()
+        def finalize() -> None:
+            self.is_checking = False
+            self.executor = None
+            # Перерисовка с новой сортировкой: рабочие IPv6 → рабочие IPv4
+            # → проверяющиеся → нерабочие, по возрастанию пинга.
+            self._refresh_table()
+            if self.cancel_event.is_set():
+                self.log_status("Проверка остановлена.")
+            else:
+                ok = sum(1 for p in self.proxies.values() if p.status == STATUS_OK)
+                # Группируем ошибки по префиксу до двоеточия (`tcp:`,
+                # `tls:`, `http:`, `xray:`, `dns:`, …) — пользователю
+                # сразу видно, ЧТО валится. Показываем топ-5 категорий.
+                cats: dict[str, int] = {}
+                for p in self.proxies.values():
+                    if p.status == STATUS_FAIL and p.error:
+                        cat = p.error.split(":", 1)[0].strip() or "?"
+                        cats[cat] = cats.get(cat, 0) + 1
+                if cats:
+                    top = sorted(cats.items(), key=lambda x: -x[1])[:5]
+                    breakdown = ", ".join(f"{k}: {v}" for k, v in top)
+                    self.log_status(
+                        f"Проверка завершена. Рабочих: {ok}. Причины фейлов: {breakdown}"
+                    )
+                else:
+                    self.log_status(f"Проверка завершена. Рабочих: {ok}")
+            self.after(1500, lambda: self.progress.set(0))
+
+        # Старт стадии 1 в фоне.
+        threading.Thread(target=stage1_then_stage2, daemon=True, name="stage1").start()
 
     # ------------------------------------------------------------ Авто-обновление
     def _schedule_auto_refresh(self) -> None:

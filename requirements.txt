@@ -1,5 +1,10 @@
 customtkinter>=5.2.2
-requests>=2.32.0
+# requests[socks] обязателен — проверка прокси ходит через локальный SOCKS5,
+# который поднимает Xray. Без PySocks requests падает с InvalidSchema на
+# socks5h:// и любая проверка завершается «нерабочим» независимо от
+# реальной прокси.
+requests[socks]>=2.32.0
+PySocks>=1.7.1
 dnspython>=2.6.1
 # Опционально: для сбора ссылок из Telegram-каналов.
 # Закомментируйте, если не нужен Telegram-скрапинг.
